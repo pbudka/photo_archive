@@ -1,85 +1,141 @@
+
 import hashlib
-import re
+import os
 from pathlib import Path
+from typing import Any
 
 import imagehash
-from PIL import ExifTags, Image
+from PIL import Image, ExifTags
 
-from photo_archive.models import Photo
-
-
-IMAGE_EXTENSIONS = {".jpg", ".jpeg"}
-RAW_EXTENSIONS = {".nef"}
+from .cache import CacheManager
+from .models import Photo
+from .progress import ProgressReporter
 
 
 class ArchiveScanner:
+    IMAGE_EXTENSIONS = {".jpg", ".jpeg"}
 
-    def scan_originals(self, root: Path) -> list[Photo]:
-        photos = []
+    def __init__(self, cache: CacheManager | None = None):
+        self.cache = cache
 
-        if not root.is_dir():
-            raise ValueError(f"Original archive does not exist: {root}")
-
-        for path in sorted(root.rglob("*")):
-            if not path.is_file():
-                continue
-
-            if path.suffix.lower() not in IMAGE_EXTENSIONS:
-                continue
-
-            month = self._find_month(path, root)
-
-            photo = self._create_photo(path, root)
-
-            photo.month = month
-            photo.source_folder = str(path.parent.relative_to(root))
-
-            photos.append(photo)
-
-        return photos
-
-    def scan_favourites(self, root: Path) -> list[Photo]:
-        photos = []
+    def scan(
+            self,
+            root: str | Path,
+            is_favourites: bool = False,
+    ) -> list[Photo]:
+        root = Path(root).resolve()
 
         if not root.is_dir():
-            raise ValueError(f"Favourites directory does not exist: {root}")
+            raise NotADirectoryError(f"Directory does not exist: {root}")
 
-        for path in sorted(root.rglob("*")):
-            if not path.is_file():
-                continue
+        scan_kind = "favourites" if is_favourites else "original"
+        root_path = str(root)
 
-            if path.suffix.lower() not in IMAGE_EXTENSIONS:
-                continue
+        # Enumerate paths and obtain basic file information.
+        # This does not open or decode the image files.
+        files: list[tuple[Path, os.stat_result]] = []
 
-            photo = self._create_photo(path, root)
+        for directory, _, filenames in os.walk(root):
+            for filename in filenames:
+                path = Path(directory) / filename
 
-            relative = path.relative_to(root)
+                if path.suffix.lower() not in self.IMAGE_EXTENSIONS:
+                    continue
 
-            # The first directory below the favourites root is the album.
-            # Files directly in the root belong to "(root)".
-            photo.favourite_album = (
-                relative.parts[0] if len(relative.parts) > 1 else "(root)"
-            )
+                try:
+                    files.append((path, path.stat()))
+                except OSError as error:
+                    print(f"Cannot inspect {path}: {error}")
 
-            photos.append(photo)
-
-        return photos
-
-    def _create_photo(self, path: Path, root: Path) -> Photo:
-        relative_path = str(path.relative_to(root))
-
-        return Photo(
-            path=path,
-            relative_path=relative_path,
-            filename=path.name,
-            extension=path.suffix.lower(),
-            sha256=self._sha256(path),
-            perceptual_hash=self._perceptual_hash(path),
-            metadata=self._read_exif(path),
+        progress = ProgressReporter(
+            f"Scanning {scan_kind}",
+            len(files),
         )
 
+        photos: list[Photo] = []
+        seen_paths: set[str] = set()
+        reused_count = 0
+        analysed_count = 0
+
+        try:
+            for path, file_stat in files:
+                relative_path = path.relative_to(root).as_posix()
+                absolute_path = str(path.resolve())
+
+                seen_paths.add(absolute_path)
+
+                cached = None
+                if self.cache is not None:
+                    cached = self.cache.get(
+                        scan_kind=scan_kind,
+                        root_path=root_path,
+                        file_path=absolute_path,
+                        file_size=file_stat.st_size,
+                        mtime_ns=file_stat.st_mtime_ns,
+                    )
+
+                if cached is not None:
+                    sha256 = cached["sha256"]
+                    perceptual_hash = cached["perceptual_hash"]
+                    metadata = cached["metadata"]
+                    reused_count += 1
+                else:
+                    sha256 = self._calculate_sha256(path)
+                    perceptual_hash = self._calculate_perceptual_hash(path)
+                    metadata = self._extract_metadata(path)
+                    analysed_count += 1
+
+                    if self.cache is not None:
+                        self.cache.put(
+                            scan_kind=scan_kind,
+                            root_path=root_path,
+                            file_path=absolute_path,
+                            file_size=file_stat.st_size,
+                            mtime_ns=file_stat.st_mtime_ns,
+                            sha256=sha256,
+                            perceptual_hash=perceptual_hash,
+                            metadata=metadata,
+                        )
+
+                photo = self._create_photo(
+                    root=root,
+                    path=path,
+                    relative_path=relative_path,
+                    sha256=sha256,
+                    perceptual_hash=perceptual_hash,
+                    metadata=metadata,
+                    is_favourites=is_favourites,
+                )
+
+                photos.append(photo)
+                progress.advance()
+
+            progress.finish()
+
+        except Exception:
+            # Do not delete cache entries if the scan did not complete.
+            raise
+
+        removed_count = 0
+        if self.cache is not None:
+            removed_count = self.cache.remove_missing(
+                scan_kind=scan_kind,
+                root_path=root_path,
+                seen_paths=seen_paths,
+            )
+
+        print(
+            f"{scan_kind.capitalize()} scan summary: "
+            f"{reused_count:,} reused, "
+            f"{analysed_count:,} analysed, "
+            f"{removed_count:,} removed from cache",
+            flush=True,
+        )
+
+        return photos
+
     @staticmethod
-    def _sha256(path: Path) -> str:
+    def _calculate_sha256(path: Path) -> str:
         digest = hashlib.sha256()
 
         with path.open("rb") as file:
@@ -89,63 +145,137 @@ class ArchiveScanner:
         return digest.hexdigest()
 
     @staticmethod
-    def _perceptual_hash(path: Path) -> str | None:
+    def _calculate_perceptual_hash(path: Path) -> str | None:
         try:
             with Image.open(path) as image:
                 return str(imagehash.phash(image.convert("RGB")))
-        except Exception:
+        except Exception as error:
+            print(f"Could not calculate perceptual hash for {path}: {error}")
             return None
 
     @staticmethod
-    def _read_exif(path: Path) -> dict[str, str]:
-        result = {}
+    def _extract_metadata(path: Path) -> dict[str, Any]:
+        metadata: dict[str, Any] = {}
 
         try:
             with Image.open(path) as image:
                 exif = image.getexif()
 
-                if not exif:
-                    return result
-
-                # Standard TIFF/EXIF tags.
                 for tag_id, value in exif.items():
-                    name = ExifTags.TAGS.get(tag_id, str(tag_id))
+                    tag_name = ExifTags.TAGS.get(tag_id, str(tag_id))
 
-                    if value is not None:
-                        result[name] = str(value)
+                    # Store JSON-compatible values.
+                    if isinstance(value, bytes):
+                        value = value.hex()
+                    elif not isinstance(
+                            value,
+                            (str, int, float, bool, type(None)),
+                    ):
+                        value = str(value)
 
-                # DateTimeOriginal and other EXIF IFD fields.
+                    metadata[tag_name] = value
+
+                # Camera-specific EXIF data is often stored in EXIF IFD.
                 try:
                     exif_ifd = exif.get_ifd(ExifTags.IFD.Exif)
-
                     for tag_id, value in exif_ifd.items():
-                        name = ExifTags.TAGS.get(tag_id, str(tag_id))
+                        tag_name = ExifTags.TAGS.get(
+                            tag_id,
+                            str(tag_id),
+                        )
 
-                        if value is not None:
-                            result[name] = str(value)
+                        if isinstance(value, bytes):
+                            value = value.hex()
+                        elif not isinstance(
+                                value,
+                                (str, int, float, bool, type(None)),
+                        ):
+                            value = str(value)
 
+                        metadata[tag_name] = value
                 except (AttributeError, KeyError, TypeError):
                     pass
 
-        except Exception:
-            pass
+        except Exception as error:
+            print(f"Could not extract EXIF from {path}: {error}")
 
-        return result
-
-    @staticmethod
-    def _find_month(path: Path, root: Path) -> str | None:
-        relative = path.relative_to(root)
-
-        for part in relative.parts:
-            if re.fullmatch(r"\d{4}", part):
-                return part
-
-        return None
+        return metadata
 
     @staticmethod
-    def count_files(root: Path, extensions: set[str]) -> int:
-        return sum(
-            1
-            for path in root.rglob("*")
-            if path.is_file() and path.suffix.lower() in extensions
+    def _create_photo(
+            root: Path,
+            path: Path,
+            relative_path: str,
+            sha256: str,
+            perceptual_hash: str | None,
+            metadata: dict[str, Any],
+            is_favourites: bool,
+    ) -> Photo:
+        parts = Path(relative_path).parts
+
+        # Original archive month is normally the first YYMM directory.
+        month = (
+            parts[0]
+            if not is_favourites and parts
+            else None
         )
+
+        # For favourites, the first directory under the favourites root
+        # is treated as the album name.
+        favourite_album = (
+            parts[0]
+            if is_favourites and len(parts) > 1
+            else None
+        )
+
+        # For originals, use the immediate parent directory as the
+        # source-folder identifier.
+        source_folder = (
+            str(Path(relative_path).parent)
+            if not is_favourites
+            else None
+        )
+
+        return Photo(
+            path=path,
+            relative_path=relative_path,
+            filename=path.name,
+            extension=path.suffix.lower(),
+            sha256=sha256,
+            perceptual_hash=perceptual_hash,
+            metadata=metadata,
+            month=month,
+            source_folder=source_folder,
+            favourite_album=favourite_album,
+        )
+
+
+    @staticmethod
+    def count_files(
+            root: str | Path,
+            extensions: set[str] | None = None,
+    ) -> int:
+        """Count files recursively, optionally filtering by extension."""
+
+        root = Path(root)
+
+        if not root.is_dir():
+            return 0
+
+        extensions = (
+            {extension.lower() for extension in extensions}
+            if extensions
+            else None
+        )
+
+        count = 0
+
+        for directory, _, filenames in os.walk(root):
+            for filename in filenames:
+                if (
+                        extensions is None
+                        or Path(filename).suffix.lower() in extensions
+                ):
+                    count += 1
+
+        return count

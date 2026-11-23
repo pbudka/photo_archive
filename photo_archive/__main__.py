@@ -5,8 +5,7 @@ from photo_archive.analysis import ArchiveAnalysis
 from photo_archive.matcher import PhotoMatcher
 from photo_archive.report import HtmlReport
 from photo_archive.scanner import ArchiveScanner
-from photo_archive.sequence import SequenceAnalyzer
-
+from photo_archive.cache import CacheManager
 
 def parse_arguments():
     parser = argparse.ArgumentParser(
@@ -41,27 +40,29 @@ def parse_arguments():
 def main():
     args = parse_arguments()
 
-    scanner = ArchiveScanner()
+    cache_path = Path("data") / "archive_cache.sqlite"
+
+    with CacheManager(cache_path) as cache:
+        scanner = ArchiveScanner(cache)
+
+        print("\nPHOTO ARCHIVE ANALYSER")
+        print("======================")
+
+        print("\n[1/5] Scanning original archive")
+
+        originals = scanner.scan(
+            args.source,
+            is_favourites=False,
+        )
+
+        print("\n[2/5] Scanning favourites")
+
+        favourites = scanner.scan(
+            args.favourites,
+            is_favourites=True,
+        )
+
     matcher = PhotoMatcher()
-
-    print("\nPHOTO ARCHIVE ANALYSER")
-    print("======================")
-
-    print("\n[1/5] Scanning original archive")
-
-    contents = scanner.count_archive_contents(args.source)
-
-    print(f"      Folders: {contents['folders']:,}")
-    print(f"      Files:   {contents['files']:,}")
-    print(f"      JPGs:    {contents['jpgs']:,}")
-    print(f"      NEFs:    {contents['nefs']:,}")
-
-    originals = scanner.scan_originals(args.source)
-
-    print("\n[2/5] Scanning favourites")
-
-    favourites = scanner.scan_favourites(args.favourites)
-
     print("\n[3/5] Matching photographs")
 
     matches = matcher.match(favourites, originals)
